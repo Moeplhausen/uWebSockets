@@ -36,7 +36,31 @@ There are a few compilation flags for µSockets (see its documentation), but com
 * LIBUS_NO_SSL - disable OpenSSL dependency/functionality for uSockets and uWebSockets builds
 * UWS_NO_ZLIB - disable Zlib dependency/functionality for uWebSockets
 
-You can use the Makefile on Linux and macOS. It is simple to use and builds the examples for you. `WITH_OPENSSL=1 make` builds all examples with SSL enabled. Examples will fail to listen if cert and key cannot be found, so make sure to specify a path that works for you.
+**CMake support**
+
+To simplify integration in CMake-based environments, support with additional options to enable/disable OpenSSL and LibUV is available. Possible command line options:
+
+* ENABLE_OPENSSL: boolean (ON/OFF); default: OFF
+* ENABLE_LIBUV: boolean (ON/OFF); default: OFF
+* BUILD_EXAMPLES: boolean (ON/OFF); default: OFF
+
+Common usage (with defaults):
+
+```sh
+mkdir build && cd build
+cmake ..
+cmake --build .
+cmake --install .
+```
+
+Usage with options - all explicitly enabled:
+
+```sh
+mkdir build && cd build
+cmake -DENABLE_OPENSSL=ON -DENABLE_LIBUV=ON -DBUILD_EXAMPLES=ON ..
+cmake --build .
+cmake --install .
+```
 
 ## User manual
 
