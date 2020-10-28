@@ -36,6 +36,40 @@ There are a few compilation flags for µSockets (see its documentation), but com
 * LIBUS_NO_SSL - disable OpenSSL dependency/functionality for uSockets and uWebSockets builds
 * UWS_NO_ZLIB - disable Zlib dependency/functionality for uWebSockets
 
+**CMake support**
+
+To simplify integration in CMake-based environments, support with additional options to enable/disable OpenSSL and LibUV is available. Possible command line options:
+
+* ENABLE_OPENSSL: boolean (ON/OFF); default: OFF
+* ENABLE_LIBUV: boolean (ON/OFF); default: OFF
+* BUILD_EXAMPLES: boolean (ON/OFF); default: OFF
+
+Common usage (with defaults):
+
+```sh
+mkdir build && cd build
+cmake ..
+cmake --build .
+cmake --install .
+```
+
+Usage with options - all explicitly enabled:
+
+```sh
+mkdir build && cd build
+cmake -DENABLE_OPENSSL=ON -DENABLE_LIBUV=ON -DBUILD_EXAMPLES=ON ..
+cmake --build .
+cmake --install .
+```
+
+*Hint:*
+The generic cmake `--build` and `--install` calls may need a CMake version 3.15 or higher.
+Older versions (3.11+) can be used the usual way using the generated Makefile targets:
+```sh
+make
+make install
+```
+
 ## User manual
 
 ### uWS::App & uWS::SSLApp
