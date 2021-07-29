@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.11)
 project(uwebsockets)
 
 # -- Versioning information
-set(${PROJECT_NAME}_normalized_version "18.15.1")
+set(${PROJECT_NAME}_normalized_version "19.3.0")
 
 # -- CMake included modules
 include(GNUInstallDirs)
