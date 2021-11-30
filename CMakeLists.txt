@@ -65,8 +65,11 @@ if(ENABLE_LIBUV)
 endif()
 
 # -- Detailed project setup
+if (MINGW)
+add_library(${PROJECT_NAME} STATIC)
+else ()
 add_library(${PROJECT_NAME} SHARED)
-
+endif()
 target_sources(${PROJECT_NAME}
   PRIVATE
     ${${PROJECT_NAME}_SOURCES_LIB})
