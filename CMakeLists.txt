@@ -15,6 +15,12 @@ option(ENABLE_OPENSSL  "Enable OpenSSL support" OFF)
 option(ENABLE_LIBUV    "Enable LibUV support"   OFF)
 option(BUILD_EXAMPLES  "Build examples"         OFF)
 
+
+if (MINGW)
+  set(ENABLE_LIBUV ON)
+endif()
+
+
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/modules")
 
 # -- Set c/cxx standard
@@ -65,11 +71,8 @@ if(ENABLE_LIBUV)
 endif()
 
 # -- Detailed project setup
-if (MINGW)
-add_library(${PROJECT_NAME} STATIC)
-else ()
-add_library(${PROJECT_NAME} SHARED)
-endif()
+
+add_library(${PROJECT_NAME})
 target_sources(${PROJECT_NAME}
   PRIVATE
     ${${PROJECT_NAME}_SOURCES_LIB})
