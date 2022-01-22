@@ -16,12 +16,6 @@ option(ENABLE_LIBUV "Enable LibUV support" OFF)
 option(BUILD_EXAMPLES "Build examples" OFF)
 
 
-if (MINGW)
-    set(ENABLE_LIBUV ON)
-    set(ENABLE_OPENSSL ON)
-endif ()
-
-
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/modules")
 
 # -- Set c/cxx standard
