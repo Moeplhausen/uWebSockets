@@ -18,6 +18,22 @@
 #ifndef UWS_APP_H
 #define UWS_APP_H
 
+#include <string>
+
+namespace uWS {
+    /* Type queued up when publishing */
+    struct TopicTreeMessage {
+        std::string message;
+        /*OpCode*/ int opCode;
+        bool compress;
+    };
+    struct TopicTreeBigMessage {
+        std::string_view message;
+        /*OpCode*/ int opCode;
+        bool compress;
+    };
+}
+
 /* An app is a convenience wrapper of some of the most used fuctionalities and allows a
  * builder-pattern kind of init. Apps operate on the implicit thread local Loop */
 
@@ -53,9 +69,12 @@ struct TemplatedApp {
 private:
     /* The app always owns at least one http context, but creates websocket contexts on demand */
     HttpContext<SSL> *httpContext;
-    std::vector<WebSocketContext<SSL, true, int> *> webSocketContexts;
+    /* WebSocketContexts are of differing type, but we as owners and creators must delete them correctly */
+    std::vector<MoveOnlyFunction<void()>> webSocketContextDeleters;
 
 public:
+
+    TopicTree<TopicTreeMessage, TopicTreeBigMessage> *topicTree = nullptr;
 
     /* Server name */
     TemplatedApp &&addServerName(std::string hostname_pattern, SocketContextOptions options = {}) {
@@ -99,9 +118,17 @@ public:
     /* Publishes a message to all websocket contexts - conceptually as if publishing to the one single
      * TopicTree of this app (technically there are many TopicTrees, however the concept is that one
      * app has one conceptual Topic tree) */
-    void publish(std::string_view topic, std::string_view message, OpCode opCode, bool compress = false) {
-        for (auto *webSocketContext : webSocketContexts) {
-            webSocketContext->getExt()->publish(topic, message, opCode, compress);
+    bool publish(std::string_view topic, std::string_view message, OpCode opCode, bool compress = false) {
+        /* Anything big bypasses corking efforts */
+        if (message.length() >= LoopData::CORK_BUFFER_SIZE) {
+            return topicTree->publishBig(nullptr, topic, {message, opCode, compress}, [](Subscriber *s, TopicTreeBigMessage &message) {
+                auto *ws = (WebSocket<SSL, true, int> *) s->user;
+
+                /* Send will drain if needed */
+                ws->send(message.message, (OpCode)message.opCode, message.compress);
+            });
+        } else {
+            return topicTree->publish(nullptr, topic, {std::string(message), opCode, compress});
         }
     }
 
@@ -109,18 +136,12 @@ public:
      * This function should probably be optimized a lot in future releases,
      * it could be O(1) with a hash map of fullnames and their counts. */
     unsigned int numSubscribers(std::string_view topic) {
-        unsigned int subscribers = 0;
-
-        for (auto *webSocketContext : webSocketContexts) {
-            auto *webSocketContextData = webSocketContext->getExt();
-
-            Topic *t = webSocketContextData->topicTree.lookupTopic(topic);
-            if (t) {
-                subscribers += t->subs.size();
-            }
+        Topic *t = topicTree->lookupTopic(topic);
+        if (t) {
+            return (unsigned int) t->size();
         }
 
-        return subscribers;
+        return 0;
     }
 
     ~TemplatedApp() {
@@ -128,9 +149,20 @@ public:
         if (httpContext) {
             httpContext->free();
 
-            for (auto *webSocketContext : webSocketContexts) {
-                webSocketContext->free();
+            /* Free all our webSocketContexts in a type less way */
+            for (auto &webSocketContextDeleter : webSocketContextDeleters) {
+                webSocketContextDeleter();
             }
+        }
+
+        /* Delete TopicTree */
+        if (topicTree) {
+            delete topicTree;
+
+            /* And unregister loop callbacks */
+            /* We must unregister any loop post handler here */
+            Loop::get()->removePostHandler(topicTree);
+            Loop::get()->removePreHandler(topicTree);
         }
     }
 
@@ -142,8 +174,12 @@ public:
         httpContext = other.httpContext;
         other.httpContext = nullptr;
 
-        /* Move webSocketContexts */
-        webSocketContexts = std::move(other.webSocketContexts);
+        /* Move webSocketContextDeleters */
+        webSocketContextDeleters = std::move(other.webSocketContextDeleters);
+
+        /* Move TopicTree */
+        topicTree = other.topicTree;
+        other.topicTree = nullptr;
     }
 
     TemplatedApp(SocketContextOptions options = {}) {
@@ -200,21 +236,67 @@ public:
             std::cerr << "Warning: idleTimeout should be a multiple of 4!" << std::endl;
         }
 
+        /* If we don't have a TopicTree yet, create one now */
+        if (!topicTree) {
+
+            bool needsUncork = false;
+            topicTree = new TopicTree<TopicTreeMessage, TopicTreeBigMessage>([needsUncork](Subscriber *s, TopicTreeMessage &message, TopicTree<TopicTreeMessage, TopicTreeBigMessage>::IteratorFlags flags) mutable {
+                /* Subscriber's user is the socket */
+                /* Unfortunately we need to cast is to PerSocketData = int
+                 * since many different WebSocketContexts use the same
+                 * TopicTree now */
+                auto *ws = (WebSocket<SSL, true, int> *) s->user;
+
+                /* If this is the first message we try and cork */
+                if (flags & TopicTree<TopicTreeMessage, TopicTreeBigMessage>::IteratorFlags::FIRST) {
+                    if (ws->canCork() && !ws->isCorked()) {
+                        ((AsyncSocket<SSL> *)ws)->cork();
+                        needsUncork = true;
+                    }
+                }
+
+                /* If we ever overstep maxBackpresure, exit immediately */
+                if (WebSocket<SSL, true, int>::SendStatus::DROPPED == ws->send(message.message, (OpCode)message.opCode, message.compress)) {
+                    if (needsUncork) {
+                        ((AsyncSocket<SSL> *)ws)->uncork();
+                        needsUncork = false;
+                    }
+                    /* Stop draining */
+                    return true;
+                }
+
+                /* If this is the last message we uncork if we are corked */
+                if (flags & TopicTree<TopicTreeMessage, TopicTreeBigMessage>::IteratorFlags::LAST) {
+                    /* We should not uncork in all cases? */
+                    if (needsUncork) {
+                        ((AsyncSocket<SSL> *)ws)->uncork();
+                    }
+                }
+
+                /* Success */
+                return false;
+            });
+
+            /* And hook it up with the loop */
+            /* We empty for both pre and post just to make sure */
+            Loop::get()->addPostHandler(topicTree, [topicTree = topicTree](Loop */*loop*/) {
+                /* Commit pub/sub batches every loop iteration */
+                topicTree->drain();
+            });
+
+            Loop::get()->addPreHandler(topicTree, [topicTree = topicTree](Loop */*loop*/) {
+                /* Commit pub/sub batches every loop iteration */
+                topicTree->drain();
+            });
+        }
+
         /* Every route has its own websocket context with its own behavior and user data type */
-        auto *webSocketContext = WebSocketContext<SSL, true, UserData>::create(Loop::get(), (us_socket_context_t *) httpContext);
-
-        /* Add all other WebSocketContextData to this new WebSocketContextData */
-        for (WebSocketContext<SSL, true, int> *adjacentWebSocketContext : webSocketContexts) {
-            webSocketContext->getExt()->adjacentWebSocketContextDatas.push_back(adjacentWebSocketContext->getExt());
-        }
-
-        /* Add this WebSocketContextData to all other WebSocketContextData */
-        for (WebSocketContext<SSL, true, int> *adjacentWebSocketContext : webSocketContexts) {
-            adjacentWebSocketContext->getExt()->adjacentWebSocketContextDatas.push_back((WebSocketContextData<SSL, int> *) webSocketContext->getExt());
-        }
+        auto *webSocketContext = WebSocketContext<SSL, true, UserData>::create(Loop::get(), (us_socket_context_t *) httpContext, topicTree);
 
         /* We need to clear this later on */
-        webSocketContexts.push_back((WebSocketContext<SSL, true, int> *) webSocketContext);
+        webSocketContextDeleters.push_back([webSocketContext]() {
+            webSocketContext->free();
+        });
 
         /* Quick fix to disable any compression if set */
 #ifdef UWS_NO_ZLIB
@@ -228,7 +310,7 @@ public:
             /* Initialize loop's deflate inflate streams */
             if (!loopData->zlibContext) {
                 loopData->zlibContext = new ZlibContext;
-                loopData->inflationStream = new InflationStream;
+                loopData->inflationStream = new InflationStream(CompressOptions::DEDICATED_DECOMPRESSOR);
                 loopData->deflationStream = new DeflationStream(CompressOptions::DEDICATED_COMPRESSOR);
             }
         }

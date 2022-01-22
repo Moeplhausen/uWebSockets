@@ -72,7 +72,14 @@ private:
                         webSocketData->compressionStatus = WebSocketData::CompressionStatus::ENABLED;
 
                         LoopData *loopData = (LoopData *) us_loop_ext(us_socket_context_loop(SSL, us_socket_context(SSL, (us_socket_t *) s)));
-                        auto inflatedFrame = loopData->inflationStream->inflate(loopData->zlibContext, {data, length}, webSocketContextData->maxPayloadLength);
+                        /* Decompress using shared or dedicated decompressor */
+                        std::optional<std::string_view> inflatedFrame;
+                        if (webSocketData->inflationStream) {
+                            inflatedFrame = webSocketData->inflationStream->inflate(loopData->zlibContext, {data, length}, webSocketContextData->maxPayloadLength, false);
+                        } else {
+                            inflatedFrame = loopData->inflationStream->inflate(loopData->zlibContext, {data, length}, webSocketContextData->maxPayloadLength, true);
+                        }
+
                         if (!inflatedFrame.has_value()) {
                             forceClose(webSocketState, s, ERR_TOO_BIG_MESSAGE_INFLATION);
                             return true;
@@ -115,7 +122,7 @@ private:
                     if (webSocketData->compressionStatus == WebSocketData::CompressionStatus::COMPRESSED_FRAME) {
                             webSocketData->compressionStatus = WebSocketData::CompressionStatus::ENABLED;
 
-                            /* 9 bytes of padding for libdeflate */
+                            /* 9 bytes of padding for libdeflate, 4 for zlib */
                             webSocketData->fragmentBuffer.append("123456789");
 
                             LoopData *loopData = (LoopData *) us_loop_ext(
@@ -124,7 +131,14 @@ private:
                                 )
                             );
 
-                            auto inflatedFrame = loopData->inflationStream->inflate(loopData->zlibContext, {webSocketData->fragmentBuffer.data(), webSocketData->fragmentBuffer.length() - 9}, webSocketContextData->maxPayloadLength);
+                            /* Decompress using shared or dedicated decompressor */
+                            std::optional<std::string_view> inflatedFrame;
+                            if (webSocketData->inflationStream) {
+                                inflatedFrame = webSocketData->inflationStream->inflate(loopData->zlibContext, {webSocketData->fragmentBuffer.data(), webSocketData->fragmentBuffer.length() - 9}, webSocketContextData->maxPayloadLength, false);
+                            } else {
+                                inflatedFrame = loopData->inflationStream->inflate(loopData->zlibContext, {webSocketData->fragmentBuffer.data(), webSocketData->fragmentBuffer.length() - 9}, webSocketContextData->maxPayloadLength, true);
+                            }
+
                             if (!inflatedFrame.has_value()) {
                                 forceClose(webSocketState, s, ERR_TOO_BIG_MESSAGE_INFLATION);
                                 return true;
@@ -244,14 +258,13 @@ private:
                 /* Emit close event */
                 auto *webSocketContextData = (WebSocketContextData<SSL, USERDATA> *) us_socket_context_ext(SSL, us_socket_context(SSL, (us_socket_t *) s));
 
+                /* Make sure to unsubscribe from any pub/sub node at exit */
+                webSocketContextData->topicTree->freeSubscriber(webSocketData->subscriber);
+                webSocketData->subscriber = nullptr;
+
                 if (webSocketContextData->closeHandler) {
                     webSocketContextData->closeHandler((WebSocket<SSL, isServer, USERDATA> *) s, 1006, {(char *) reason, (size_t) code});
                 }
-
-                /* Make sure to unsubscribe from any pub/sub node at exit */
-                webSocketContextData->topicTree.unsubscribeAll(webSocketData->subscriber, false);
-                delete webSocketData->subscriber;
-                webSocketData->subscriber = nullptr;
             }
 
             /* Destruct in-placed data struct */
@@ -364,7 +377,7 @@ private:
             auto *webSocketData = (WebSocketData *)(us_socket_ext(SSL, s));
             auto *webSocketContextData = (WebSocketContextData<SSL, USERDATA> *) us_socket_context_ext(SSL, us_socket_context(SSL, (us_socket_t *) s));
 
-            if (webSocketContextData->sendPingsAutomatically && !webSocketData->hasTimedOut) {
+            if (webSocketContextData->sendPingsAutomatically && !webSocketData->isShuttingDown && !webSocketData->hasTimedOut) {
                 webSocketData->hasTimedOut = true;
                 us_socket_timeout(SSL, s, webSocketContextData->idleTimeoutComponents.second);
                 /* Send ping without being corked */
@@ -391,14 +404,14 @@ private:
 
 public:
     /* WebSocket contexts are always child contexts to a HTTP context so no SSL options are needed as they are inherited */
-    static WebSocketContext *create(Loop */*loop*/, us_socket_context_t *parentSocketContext) {
+    static WebSocketContext *create(Loop */*loop*/, us_socket_context_t *parentSocketContext, TopicTree<TopicTreeMessage, TopicTreeBigMessage> *topicTree) {
         WebSocketContext *webSocketContext = (WebSocketContext *) us_create_child_socket_context(SSL, parentSocketContext, sizeof(WebSocketContextData<SSL, USERDATA>));
         if (!webSocketContext) {
             return nullptr;
         }
 
         /* Init socket context data */
-        new ((WebSocketContextData<SSL, USERDATA> *) us_socket_context_ext(SSL, (us_socket_context_t *)webSocketContext)) WebSocketContextData<SSL, USERDATA>;
+        new ((WebSocketContextData<SSL, USERDATA> *) us_socket_context_ext(SSL, (us_socket_context_t *)webSocketContext)) WebSocketContextData<SSL, USERDATA>(topicTree);
         return webSocketContext->init();
     }
 };

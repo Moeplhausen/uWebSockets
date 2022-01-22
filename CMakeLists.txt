@@ -14,7 +14,8 @@ include(CMakePackageConfigHelpers)
 option(ENABLE_OPENSSL "Enable OpenSSL support" OFF)
 option(ENABLE_LIBUV "Enable LibUV support" OFF)
 option(BUILD_EXAMPLES "Build examples" OFF)
-
+option(ENABLE_BORINGSSL "Enable BoringSSL support" OFF)
+option(ENABLE_WOLFSSL "Enable WolfSSL support" OFF)
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/modules")
 
@@ -29,9 +30,21 @@ find_package(ZLIB REQUIRED)
 if (ENABLE_OPENSSL)
     find_package(OpenSSL REQUIRED)
     add_compile_definitions(LIBUS_USE_OPENSSL)
-else ()
-    add_compile_definitions(LIBUS_NO_SSL)
+    message("Compiling uWebsockets with OpenSSL")
 endif ()
+
+if(NOT (ENABLE_OPENSSL OR ENABLE_BORINGSSL OR ENABLE_WOLFSSL))
+    add_compile_definitions(LIBUS_NO_SSL)
+endif()
+
+if (ENABLE_BORINGSSL)
+    add_compile_definitions(LIBUS_USE_OPENSSL)
+endif()
+
+if (ENABLE_WOLFSSL)
+    add_compile_definitions(LIBUS_USE_WOLFSSL)
+endif()
+
 #add_compile_definitions(LIBUS_USE_WOLFSSL)
 
 # -- LibUV support?
@@ -54,11 +67,20 @@ set(${PROJECT_NAME}_SOURCES_LIB
         )
 
 # -- Optional sources
-if (ENABLE_OPENSSL)
+if (ENABLE_OPENSSL OR ENABLE_BORINGSSL)
     list(APPEND ${PROJECT_NAME}_SOURCES_LIB
             "${CMAKE_CURRENT_LIST_DIR}/uSockets/src/crypto/openssl.c"
             "${CMAKE_CURRENT_LIST_DIR}/uSockets/src/crypto/sni_tree.cpp")
+elseif (ENABLE_WOLFSSL)
+    list(APPEND ${PROJECT_NAME}_SOURCES_LIB
+            "${CMAKE_CURRENT_LIST_DIR}/uSockets/src/crypto/wolfssl.c"
+            "${CMAKE_CURRENT_LIST_DIR}/uSockets/src/crypto/sni_tree.cpp")
 endif ()
+
+if (ENABLE_BORINGSSL)
+add_subdirectory(uSockets/boringssl)
+endif ()
+
 
 if (ENABLE_LIBUV)
     list(APPEND ${PROJECT_NAME}_SOURCES_LIB
@@ -78,12 +100,24 @@ target_include_directories(${PROJECT_NAME}
         PUBLIC
         $<INSTALL_INTERFACE:include>
         $<INSTALL_INTERFACE:include/uwebsockets>)
-
+if (ENABLE_OPENSSL)
 target_link_libraries(${PROJECT_NAME}
         PRIVATE
         ${OPENSSL_LIBRARIES}
-        ${LIBUV_LIBRARIES})
-
+        ${LIBUV_LIBRARIES}
+        )
+elseif(ENABLE_BORINGSSL)
+    target_link_libraries(${PROJECT_NAME}
+            PRIVATE
+            ${LIBUV_LIBRARIES}
+            )
+elseif(ENABLE_WOLFSSL)
+    target_link_libraries(${PROJECT_NAME}
+            PRIVATE
+            wolfssl
+            ${LIBUV_LIBRARIES}
+            )
+endif()
 set_target_properties(${PROJECT_NAME}
         PROPERTIES
         VERSION ${${PROJECT_NAME}_normalized_version}

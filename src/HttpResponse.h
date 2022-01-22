@@ -22,6 +22,7 @@
 
 #include "AsyncSocket.h"
 #include "HttpResponseData.h"
+#include "HttpContext.h"
 #include "HttpContextData.h"
 #include "Utilities.h"
 
@@ -86,7 +87,7 @@ private:
 #ifndef UWS_HTTPRESPONSE_NO_WRITEMARK
         if (!Super::getLoopData()->noMark) {
             /* We only expose major version */
-            writeHeader("uWebSockets", "19");
+            writeHeader("uWebSockets", "20");
         }
 #endif
     }
@@ -235,11 +236,14 @@ public:
         CompressOptions compressOptions = CompressOptions::DISABLED;
         if (secWebSocketExtensions.length() && webSocketContextData->compression != DISABLED) {
 
-            /* We always want shared inflation */
+            /* Make sure to map SHARED_DECOMPRESSOR to windowBits = 0, not 1  */
             int wantedInflationWindow = 0;
+            if ((webSocketContextData->compression & CompressOptions::_DECOMPRESSOR_MASK) != CompressOptions::SHARED_DECOMPRESSOR) {
+                wantedInflationWindow = (webSocketContextData->compression & CompressOptions::_DECOMPRESSOR_MASK) >> 8;
+            }
 
-            /* Map from selected compressor */
-            int wantedCompressionWindow = (webSocketContextData->compression & 0xFF00) >> 8;
+            /* Map from selected compressor (this automatically maps SHARED_COMPRESSOR to windowBits 0, not 1) */
+            int wantedCompressionWindow = (webSocketContextData->compression & CompressOptions::_COMPRESSOR_MASK) >> 4;
 
             auto [negCompression, negCompressionWindow, negInflationWindow, negResponse] =
             negotiateCompression(true, wantedCompressionWindow, wantedInflationWindow,
@@ -248,18 +252,25 @@ public:
             if (negCompression) {
                 perMessageDeflate = true;
 
-                /* Map from windowBits to compressor */
+                /* Map from negotiated windowBits to compressor and decompressor */
                 if (negCompressionWindow == 0) {
                     compressOptions = CompressOptions::SHARED_COMPRESSOR;
                 } else {
-                    compressOptions = (CompressOptions) ((uint32_t) (negCompressionWindow << 8)
+                    compressOptions = (CompressOptions) ((uint32_t) (negCompressionWindow << 4)
                                                         | (uint32_t) (negCompressionWindow - 7));
 
                     /* If we are dedicated and have the 3kb then correct any 4kb to 3kb,
                      * (they both share the windowBits = 9) */
-                    if (webSocketContextData->compression == DEDICATED_COMPRESSOR_3KB) {
+                    if (webSocketContextData->compression & DEDICATED_COMPRESSOR_3KB) {
                         compressOptions = DEDICATED_COMPRESSOR_3KB;
                     }
+                }
+
+                /* Here we modify the above compression with negotiated decompressor */
+                if (negInflationWindow == 0) {
+                    compressOptions = CompressOptions(compressOptions | CompressOptions::SHARED_DECOMPRESSOR);
+                } else {
+                    compressOptions = CompressOptions(compressOptions | (negInflationWindow << 8));
                 }
 
                 writeHeader("Sec-WebSocket-Extensions", negResponse);
@@ -272,7 +283,7 @@ public:
         HttpContext<SSL> *httpContext = (HttpContext<SSL> *) us_socket_context(SSL, (struct us_socket_t *) this);
 
         /* Move any backpressure out of HttpResponse */
-        std::string backpressure(std::move(((AsyncSocketData<SSL> *) getHttpResponseData())->buffer));
+        BackPressure backpressure(std::move(((AsyncSocketData<SSL> *) getHttpResponseData())->buffer));
 
         /* Destroy HttpResponseData */
         getHttpResponseData()->~HttpResponseData();
@@ -286,7 +297,7 @@ public:
 
         /* For whatever reason we were corked, update cork to the new socket */
         if (wasCorked) {
-            webSocket->AsyncSocket<SSL>::cork();
+            webSocket->AsyncSocket<SSL>::corkUnchecked();
         }
 
         /* Initialize websocket with any moved backpressure intact */
@@ -366,6 +377,15 @@ public:
         writeUnsigned64(value);
         Super::write("\r\n", 2);
         return this;
+    }
+
+    /* End without a body (no content-length) or end with a spoofed content-length. */
+    void endWithoutBody(std::optional<size_t> reportedContentLength = std::nullopt, bool closeConnection = false) {
+        if (reportedContentLength.has_value()) {
+            //internalEnd({nullptr, 0}, reportedContentLength.value(), false, true, closeConnection);
+        } else {
+            internalEnd({nullptr, 0}, 0, false, false, closeConnection);
+        }
     }
 
     /* End the response with an optional data chunk. Always starts a timeout. */
