@@ -24,32 +24,19 @@
  * to unsigned length for everything to/from uSockets - this would however remove the opportunity
  * to signal error with -1 (which is how the entire UNIX syscalling is built). */
 
-#include <cstring>
-#include <iostream>
-
-#include "libusockets.h"
-
 #include "LoopData.h"
 #include "AsyncSocketData.h"
 
 namespace uWS {
 
-    enum SendBufferAttribute {
-        NEEDS_NOTHING,
-        NEEDS_DRAIN,
-        NEEDS_UNCORK
-    };
-
-    template <bool, bool, typename> struct WebSocketContext;
+    template <bool, bool> struct WebSocketContext;
 
 template <bool SSL>
 struct AsyncSocket {
-    /* This guy is promiscuous */
     template <bool> friend struct HttpContext;
-    template <bool, bool, typename> friend struct WebSocketContext;
-    template <bool> friend struct TemplatedApp;
-    template <bool, typename> friend struct WebSocketContextData;
-    template <typename, typename> friend struct TopicTree;
+    template <bool, bool> friend struct WebSocketContext;
+    template <bool> friend struct WebSocketContextData;
+    friend struct TopicTree;
 
 protected:
     /* Returns SSL pointer or FD as pointer */
@@ -82,19 +69,8 @@ protected:
         return us_socket_close(SSL, (us_socket_t *) this, 0, nullptr);
     }
 
-    void corkUnchecked() {
-        /* What if another socket is corked? */
-        getLoopData()->corkedSocket = this;
-    }
-
     /* Cork this socket. Only one socket may ever be corked per-loop at any given time */
     void cork() {
-        /* Extra check for invalid corking of others */
-        if (getLoopData()->corkOffset && getLoopData()->corkedSocket != this) {
-            std::cerr << "Error: Cork buffer must not be acquired without checking canCork!" << std::endl;
-            std::terminate();
-        }
-
         /* What if another socket is corked? */
         getLoopData()->corkedSocket = this;
     }
@@ -110,47 +86,22 @@ protected:
     }
 
     /* Returns a suitable buffer for temporary assemblation of send data */
-    std::pair<char *, SendBufferAttribute> getSendBuffer(size_t size) {
-        /* First step is to determine if we already have backpressure or not */
+    std::pair<char *, bool> getSendBuffer(size_t size) {
+        /* If we are corked and we have room, return the cork buffer itself */
         LoopData *loopData = getLoopData();
-        BackPressure &backPressure = getAsyncSocketData()->buffer;
-        size_t existingBackpressure = backPressure.length();
-        if ((!existingBackpressure) && (isCorked() || canCork()) && (loopData->corkOffset + size < LoopData::CORK_BUFFER_SIZE)) {
-            /* Cork automatically if we can */
-            if (isCorked()) {
-                char *sendBuffer = loopData->corkBuffer + loopData->corkOffset;
-                loopData->corkOffset += (unsigned int) size;
-                return {sendBuffer, SendBufferAttribute::NEEDS_NOTHING};
-            } else {
-                cork();
-                char *sendBuffer = loopData->corkBuffer + loopData->corkOffset;
-                loopData->corkOffset += (unsigned int) size;
-                return {sendBuffer, SendBufferAttribute::NEEDS_UNCORK};
-            }
+        if (loopData->corkedSocket == this && loopData->corkOffset + size < LoopData::CORK_BUFFER_SIZE) {
+            char *sendBuffer = loopData->corkBuffer + loopData->corkOffset;
+            loopData->corkOffset += (unsigned int) size;
+            return {sendBuffer, false};
         } else {
-
-            /* If we are corked and there is already data in the cork buffer,
-            mark how much is ours and reset it */
-            unsigned int ourCorkOffset = 0;
-            if (isCorked() && loopData->corkOffset) {
-                ourCorkOffset = loopData->corkOffset;
-                loopData->corkOffset = 0;
-            }
-
-            /* Fallback is to use the backpressure as buffer */
-            backPressure.resize(ourCorkOffset + existingBackpressure + size);
-
-            /* And copy corkbuffer in front */
-            memcpy((char *) backPressure.data() + existingBackpressure, loopData->corkBuffer, ourCorkOffset);
-
-            return {(char *) backPressure.data() + ourCorkOffset + existingBackpressure, SendBufferAttribute::NEEDS_DRAIN};
+            /* Slow path for now, we want to always be corked if possible */
+            return {(char *) malloc(size), true};
         }
     }
 
     /* Returns the user space backpressure. */
     unsigned int getBufferedAmount() {
-        /* We return the actual amount of bytes in backbuffer, including pendingRemoval */
-        return (unsigned int) getAsyncSocketData()->buffer.totalLength();
+        return (unsigned int) getAsyncSocketData()->buffer.size();
     }
 
     /* Returns the text representation of an IPv4 or IPv6 address */
@@ -209,7 +160,7 @@ protected:
             if ((unsigned int) written < asyncSocketData->buffer.length()) {
 
                 /* Update buffering (todo: we can do better here if we keep track of what happens to this guy later on) */
-                asyncSocketData->buffer.erase((unsigned int) written);
+                asyncSocketData->buffer = asyncSocketData->buffer.substr((size_t) written);
 
                 if (optionally) {
                     /* Thankfully we can exit early here */

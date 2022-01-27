@@ -39,6 +39,21 @@ namespace uWS {
             remainingLine = line;
         }
 
+        /* Common parameter */
+        std::string_view getName() {
+            return name;
+        }
+
+        /* Common parameter */
+        std::string_view getFilename() {
+            return filename;
+        }
+
+        /* Parses common values */
+        void parseCommonValues() {
+
+        }
+
         /* Returns next key/value where value can simply be empty.
          * If key (first) is empty then we are at the end */
         std::pair<std::string_view, std::string_view> getKeyValue() {
@@ -61,6 +76,7 @@ namespace uWS {
 
     private:
         std::string_view remainingLine;
+        std::string_view filename, name;
 
         /* Consumes a token from the line. Will "unquote" strings */
         std::string_view getToken() {
@@ -90,11 +106,6 @@ namespace uWS {
                         while (remainingLine.length() && remainingLine[0] != '\"') {
                             remainingLine.remove_prefix(1);
                             quoteLength++;
-                        }
-
-                        /* We can't remove_prefix if we have nothing to remove */
-                        if (!remainingLine.length()) {
-                            return {};
                         }
 
                         remainingLine.remove_prefix(1);

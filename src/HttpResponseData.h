@@ -24,7 +24,7 @@
 #include "AsyncSocketData.h"
 #include "ProxyParser.h"
 
-#include "MoveOnlyFunction.h"
+#include "f2/function2.hpp"
 
 namespace uWS {
 
@@ -43,11 +43,11 @@ private:
     };
 
     /* Per socket event handlers */
-    MoveOnlyFunction<bool(uintmax_t)> onWritable;
-    MoveOnlyFunction<void()> onAborted;
-    MoveOnlyFunction<void(std::string_view, bool)> inStream; // onData
+    fu2::unique_function<bool(size_t)> onWritable;
+    fu2::unique_function<void()> onAborted;
+    fu2::unique_function<void(std::string_view, bool)> inStream; // onData
     /* Outgoing offset */
-    uintmax_t offset = 0;
+    size_t offset = 0;
 
     /* Current state (content-length sent, status sent, write called, etc */
     int state = 0;

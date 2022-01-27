@@ -18,8 +18,6 @@
 #ifndef UWS_WEBSOCKETPROTOCOL_H
 #define UWS_WEBSOCKETPROTOCOL_H
 
-#include <libusockets.h>
-
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -35,7 +33,6 @@ const std::string_view ERR_TOO_BIG_MESSAGE_INFLATION("Received too big message, 
 const std::string_view ERR_INVALID_CLOSE_PAYLOAD("Received invalid close payload");
 
 enum OpCode : unsigned char {
-    CONTINUATION = 0,
     TEXT = 1,
     BINARY = 2,
     CLOSE = 8,
@@ -206,7 +203,7 @@ enum {
 };
 
 template <bool isServer>
-static inline size_t formatMessage(char *dst, const char *src, size_t length, OpCode opCode, size_t reportedLength, bool compressed, bool fin) {
+static inline size_t formatMessage(char *dst, const char *src, size_t length, OpCode opCode, size_t reportedLength, bool compressed) {
     size_t messageLength;
     size_t headerLength;
     if (reportedLength < 126) {
@@ -224,9 +221,11 @@ static inline size_t formatMessage(char *dst, const char *src, size_t length, Op
         memcpy(&dst[2], &tmp, sizeof(uint64_t));
     }
 
-    dst[0] = (char) ((fin ? 128 : 0) | ((compressed && opCode) ? SND_COMPRESSED : 0) | (char) opCode);
-
-    //printf("%d\n", (int)dst[0]);
+    int flags = 0;
+    dst[0] = (char) ((flags & SND_NO_FIN ? 0 : 128) | (compressed ? SND_COMPRESSED : 0));
+    if (!(flags & SND_CONTINUATION)) {
+        dst[0] |= (char) opCode;
+    }
 
     char mask[4];
     if (!isServer) {
