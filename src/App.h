@@ -18,6 +18,42 @@
 #ifndef UWS_APP_H
 #define UWS_APP_H
 
+#include <string>
+#include <charconv>
+#include <string_view>
+
+namespace uWS {
+    /* Type queued up when publishing */
+    struct TopicTreeMessage {
+        std::string message;
+        /*OpCode*/ int opCode;
+        bool compress;
+    };
+    struct TopicTreeBigMessage {
+        std::string_view message;
+        /*OpCode*/ int opCode;
+        bool compress;
+    };
+
+    inline bool hasBrokenCompression(std::string_view userAgent) {
+        size_t pos;
+        int uaVersion = 0;
+
+        if ((pos = userAgent.find(" Version/")) == std::string_view::npos) return false;
+        pos += 9;
+
+        std::string_view uaVersionStr = userAgent.substr(pos);
+        uaVersionStr = uaVersionStr.substr(0, uaVersionStr.find_first_of(". "));
+        auto result = std::from_chars(uaVersionStr.data(), uaVersionStr.data() + uaVersionStr.size(), uaVersion);
+        if (result.ec == std::errc::invalid_argument) return false;
+        if (uaVersion != 15) return false; // we target just Safari 15 - give Apple a chance ;-)
+
+        if ((pos = userAgent.find(" Safari/", pos)) == std::string_view::npos) return false;
+
+        return true;
+    }
+}
+
 /* An app is a convenience wrapper of some of the most used fuctionalities and allows a
  * builder-pattern kind of init. Apps operate on the implicit thread local Loop */
 
@@ -53,9 +89,12 @@ struct TemplatedApp {
 private:
     /* The app always owns at least one http context, but creates websocket contexts on demand */
     HttpContext<SSL> *httpContext;
-    std::vector<WebSocketContext<SSL, true> *> webSocketContexts;
+    /* WebSocketContexts are of differing type, but we as owners and creators must delete them correctly */
+    std::vector<MoveOnlyFunction<void()>> webSocketContextDeleters;
 
 public:
+
+    TopicTree<TopicTreeMessage, TopicTreeBigMessage> *topicTree = nullptr;
 
     /* Server name */
     TemplatedApp &&addServerName(std::string hostname_pattern, SocketContextOptions options = {}) {
@@ -70,7 +109,7 @@ public:
         return std::move(*this);
     }
 
-    TemplatedApp &&missingServerName(fu2::unique_function<void(const char *hostname)> handler) {
+    TemplatedApp &&missingServerName(MoveOnlyFunction<void(const char *hostname)> handler) {
 
         if (!constructorFailed()) {
             httpContext->getSocketContextData()->missingServerNameHandler = std::move(handler);
@@ -92,15 +131,37 @@ public:
     }
 
     /* Attaches a "filter" function to track socket connections/disconnections */
-    void filter(fu2::unique_function<void(HttpResponse<SSL> *, int)> &&filterHandler) {
+    void filter(MoveOnlyFunction<void(HttpResponse<SSL> *, int)> &&filterHandler) {
         httpContext->filter(std::move(filterHandler));
     }
 
-    /* Publishes a message to all websocket contexts */
-    void publish(std::string_view topic, std::string_view message, OpCode opCode, bool compress = false) {
-        for (auto *webSocketContext : webSocketContexts) {
-            webSocketContext->getExt()->publish(topic, message, opCode, compress);
+    /* Publishes a message to all websocket contexts - conceptually as if publishing to the one single
+     * TopicTree of this app (technically there are many TopicTrees, however the concept is that one
+     * app has one conceptual Topic tree) */
+    bool publish(std::string_view topic, std::string_view message, OpCode opCode, bool compress = false) {
+        /* Anything big bypasses corking efforts */
+        if (message.length() >= LoopData::CORK_BUFFER_SIZE) {
+            return topicTree->publishBig(nullptr, topic, {message, opCode, compress}, [](Subscriber *s, TopicTreeBigMessage &message) {
+                auto *ws = (WebSocket<SSL, true, int> *) s->user;
+
+                /* Send will drain if needed */
+                ws->send(message.message, (OpCode)message.opCode, message.compress);
+            });
+        } else {
+            return topicTree->publish(nullptr, topic, {std::string(message), opCode, compress});
         }
+    }
+
+    /* Returns number of subscribers for this topic, or 0 for failure.
+     * This function should probably be optimized a lot in future releases,
+     * it could be O(1) with a hash map of fullnames and their counts. */
+    unsigned int numSubscribers(std::string_view topic) {
+        Topic *t = topicTree->lookupTopic(topic);
+        if (t) {
+            return (unsigned int) t->size();
+        }
+
+        return 0;
     }
 
     ~TemplatedApp() {
@@ -108,9 +169,20 @@ public:
         if (httpContext) {
             httpContext->free();
 
-            for (auto *webSocketContext : webSocketContexts) {
-                webSocketContext->free();
+            /* Free all our webSocketContexts in a type less way */
+            for (auto &webSocketContextDeleter : webSocketContextDeleters) {
+                webSocketContextDeleter();
             }
+        }
+
+        /* Delete TopicTree */
+        if (topicTree) {
+            delete topicTree;
+
+            /* And unregister loop callbacks */
+            /* We must unregister any loop post handler here */
+            Loop::get()->removePostHandler(topicTree);
+            Loop::get()->removePreHandler(topicTree);
         }
     }
 
@@ -122,36 +194,50 @@ public:
         httpContext = other.httpContext;
         other.httpContext = nullptr;
 
-        /* Move webSocketContexts */
-        webSocketContexts = std::move(other.webSocketContexts);
+        /* Move webSocketContextDeleters */
+        webSocketContextDeleters = std::move(other.webSocketContextDeleters);
+
+        /* Move TopicTree */
+        topicTree = other.topicTree;
+        other.topicTree = nullptr;
     }
 
     TemplatedApp(SocketContextOptions options = {}) {
-        httpContext = uWS::HttpContext<SSL>::create(uWS::Loop::get(), options);
+        httpContext = HttpContext<SSL>::create(Loop::get(), options);
     }
 
     bool constructorFailed() {
         return !httpContext;
     }
 
+    template <typename UserData>
     struct WebSocketBehavior {
+        /* Disabled compression by default - probably a bad default */
         CompressOptions compression = DISABLED;
+        /* Maximum message size we can receive */
         unsigned int maxPayloadLength = 16 * 1024;
-        unsigned int idleTimeout = 120;
-        unsigned int maxBackpressure = 1 * 1024 * 1024;
+        /* 2 minutes timeout is good */
+        unsigned short idleTimeout = 120;
+        /* 64kb backpressure is probably good */
+        unsigned int maxBackpressure = 64 * 1024;
         bool closeOnBackpressureLimit = false;
-        bool resetIdleTimeoutOnSend = true;
-        fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *, struct us_socket_context_t *)> upgrade = nullptr;
-        fu2::unique_function<void(uWS::WebSocket<SSL, true> *)> open = nullptr;
-        fu2::unique_function<void(uWS::WebSocket<SSL, true> *, std::string_view, uWS::OpCode)> message = nullptr;
-        fu2::unique_function<void(uWS::WebSocket<SSL, true> *)> drain = nullptr;
-        fu2::unique_function<void(uWS::WebSocket<SSL, true> *)> ping = nullptr;
-        fu2::unique_function<void(uWS::WebSocket<SSL, true> *)> pong = nullptr;
-        fu2::unique_function<void(uWS::WebSocket<SSL, true> *, int, std::string_view)> close = nullptr;
+        /* This one depends on kernel timeouts and is a bad default */
+        bool resetIdleTimeoutOnSend = false;
+        /* A good default, esp. for newcomers */
+        bool sendPingsAutomatically = true;
+        /* Maximum socket lifetime in seconds before forced closure (defaults to disabled) */
+        unsigned short maxLifetime = 0;
+        MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *, struct us_socket_context_t *)> upgrade = nullptr;
+        MoveOnlyFunction<void(WebSocket<SSL, true, UserData> *)> open = nullptr;
+        MoveOnlyFunction<void(WebSocket<SSL, true, UserData> *, std::string_view, OpCode)> message = nullptr;
+        MoveOnlyFunction<void(WebSocket<SSL, true, UserData> *)> drain = nullptr;
+        MoveOnlyFunction<void(WebSocket<SSL, true, UserData> *, std::string_view)> ping = nullptr;
+        MoveOnlyFunction<void(WebSocket<SSL, true, UserData> *, std::string_view)> pong = nullptr;
+        MoveOnlyFunction<void(WebSocket<SSL, true, UserData> *, int, std::string_view)> close = nullptr;
     };
 
     template <typename UserData>
-    TemplatedApp &&ws(std::string pattern, WebSocketBehavior &&behavior) {
+    TemplatedApp &&ws(std::string pattern, WebSocketBehavior<UserData> &&behavior) {
         /* Don't compile if alignment rules cannot be satisfied */
         static_assert(alignof(UserData) <= LIBUS_EXT_ALIGNMENT,
         "µWebSockets cannot satisfy UserData alignment requirements. You need to recompile µSockets with LIBUS_EXT_ALIGNMENT adjusted accordingly.");
@@ -160,15 +246,81 @@ public:
             return std::move(*this);
         }
 
+        /* Terminate on misleading idleTimeout values */
+        if (behavior.idleTimeout && behavior.idleTimeout < 8) {
+            std::cerr << "Error: idleTimeout must be either 0 or greater than 8!" << std::endl;
+            std::terminate();
+        }
+
+        if (behavior.idleTimeout % 4) {
+            std::cerr << "Warning: idleTimeout should be a multiple of 4!" << std::endl;
+        }
+
+        /* If we don't have a TopicTree yet, create one now */
+        if (!topicTree) {
+
+            bool needsUncork = false;
+            topicTree = new TopicTree<TopicTreeMessage, TopicTreeBigMessage>([needsUncork](Subscriber *s, TopicTreeMessage &message, TopicTree<TopicTreeMessage, TopicTreeBigMessage>::IteratorFlags flags) mutable {
+                /* Subscriber's user is the socket */
+                /* Unfortunately we need to cast is to PerSocketData = int
+                 * since many different WebSocketContexts use the same
+                 * TopicTree now */
+                auto *ws = (WebSocket<SSL, true, int> *) s->user;
+
+                /* If this is the first message we try and cork */
+                if (flags & TopicTree<TopicTreeMessage, TopicTreeBigMessage>::IteratorFlags::FIRST) {
+                    if (ws->canCork() && !ws->isCorked()) {
+                        ((AsyncSocket<SSL> *)ws)->cork();
+                        needsUncork = true;
+                    }
+                }
+
+                /* If we ever overstep maxBackpresure, exit immediately */
+                if (WebSocket<SSL, true, int>::SendStatus::DROPPED == ws->send(message.message, (OpCode)message.opCode, message.compress)) {
+                    if (needsUncork) {
+                        ((AsyncSocket<SSL> *)ws)->uncork();
+                        needsUncork = false;
+                    }
+                    /* Stop draining */
+                    return true;
+                }
+
+                /* If this is the last message we uncork if we are corked */
+                if (flags & TopicTree<TopicTreeMessage, TopicTreeBigMessage>::IteratorFlags::LAST) {
+                    /* We should not uncork in all cases? */
+                    if (needsUncork) {
+                        ((AsyncSocket<SSL> *)ws)->uncork();
+                    }
+                }
+
+                /* Success */
+                return false;
+            });
+
+            /* And hook it up with the loop */
+            /* We empty for both pre and post just to make sure */
+            Loop::get()->addPostHandler(topicTree, [topicTree = topicTree](Loop */*loop*/) {
+                /* Commit pub/sub batches every loop iteration */
+                topicTree->drain();
+            });
+
+            Loop::get()->addPreHandler(topicTree, [topicTree = topicTree](Loop */*loop*/) {
+                /* Commit pub/sub batches every loop iteration */
+                topicTree->drain();
+            });
+        }
+
         /* Every route has its own websocket context with its own behavior and user data type */
-        auto *webSocketContext = WebSocketContext<SSL, true>::create(Loop::get(), (us_socket_context_t *) httpContext);
+        auto *webSocketContext = WebSocketContext<SSL, true, UserData>::create(Loop::get(), (us_socket_context_t *) httpContext, topicTree);
 
         /* We need to clear this later on */
-        webSocketContexts.push_back(webSocketContext);
+        webSocketContextDeleters.push_back([webSocketContext]() {
+            webSocketContext->free();
+        });
 
         /* Quick fix to disable any compression if set */
 #ifdef UWS_NO_ZLIB
-        behavior.compression = uWS::DISABLED;
+        behavior.compression = DISABLED;
 #endif
 
         /* If we are the first one to use compression, initialize it */
@@ -178,7 +330,7 @@ public:
             /* Initialize loop's deflate inflate streams */
             if (!loopData->zlibContext) {
                 loopData->zlibContext = new ZlibContext;
-                loopData->inflationStream = new InflationStream;
+                loopData->inflationStream = new InflationStream(CompressOptions::DEDICATED_DECOMPRESSOR);
                 loopData->deflationStream = new DeflationStream(CompressOptions::DEDICATED_COMPRESSOR);
             }
         }
@@ -187,7 +339,7 @@ public:
         webSocketContext->getExt()->openHandler = std::move(behavior.open);
         webSocketContext->getExt()->messageHandler = std::move(behavior.message);
         webSocketContext->getExt()->drainHandler = std::move(behavior.drain);
-        webSocketContext->getExt()->closeHandler = std::move([closeHandler = std::move(behavior.close)](WebSocket<SSL, true> *ws, int code, std::string_view message) mutable {
+        webSocketContext->getExt()->closeHandler = std::move([closeHandler = std::move(behavior.close)](WebSocket<SSL, true, UserData> *ws, int code, std::string_view message) mutable {
             if (closeHandler) {
                 closeHandler(ws, code, message);
             }
@@ -200,11 +352,14 @@ public:
 
         /* Copy settings */
         webSocketContext->getExt()->maxPayloadLength = behavior.maxPayloadLength;
-        webSocketContext->getExt()->idleTimeout = behavior.idleTimeout;
         webSocketContext->getExt()->maxBackpressure = behavior.maxBackpressure;
         webSocketContext->getExt()->closeOnBackpressureLimit = behavior.closeOnBackpressureLimit;
         webSocketContext->getExt()->resetIdleTimeoutOnSend = behavior.resetIdleTimeoutOnSend;
+        webSocketContext->getExt()->sendPingsAutomatically = behavior.sendPingsAutomatically;
         webSocketContext->getExt()->compression = behavior.compression;
+
+        /* Calculate idleTimeoutCompnents */
+        webSocketContext->getExt()->calculateIdleTimeoutCompnents(behavior.idleTimeout);
 
         httpContext->onHttp("get", pattern, [webSocketContext, behavior = std::move(behavior)](auto *res, auto *req) mutable {
 
@@ -214,11 +369,23 @@ public:
 
                 /* Emit upgrade handler */
                 if (behavior.upgrade) {
+
+                    /* Nasty, ugly Safari 15 hack */
+                    if (hasBrokenCompression(req->getHeader("user-agent"))) {
+                        std::string_view secWebSocketExtensions = req->getHeader("sec-websocket-extensions");
+                        memset((void *) secWebSocketExtensions.data(), ' ', secWebSocketExtensions.length());
+                    }
+
                     behavior.upgrade(res, req, (struct us_socket_context_t *) webSocketContext);
                 } else {
                     /* Default handler upgrades to WebSocket */
                     std::string_view secWebSocketProtocol = req->getHeader("sec-websocket-protocol");
                     std::string_view secWebSocketExtensions = req->getHeader("sec-websocket-extensions");
+
+                    /* Safari 15 hack */
+                    if (hasBrokenCompression(req->getHeader("user-agent"))) {
+                        secWebSocketExtensions = "";
+                    }
 
                     res->template upgrade<UserData>({}, secWebSocketKey, secWebSocketProtocol, secWebSocketExtensions, (struct us_socket_context_t *) webSocketContext);
                 }
@@ -235,63 +402,63 @@ public:
         return std::move(*this);
     }
 
-    TemplatedApp &&get(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&get(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("get", pattern, std::move(handler));
         }
         return std::move(*this);
     }
 
-    TemplatedApp &&post(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&post(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("post", pattern, std::move(handler));
         }
         return std::move(*this);
     }
 
-    TemplatedApp &&options(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&options(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("options", pattern, std::move(handler));
         }
         return std::move(*this);
     }
 
-    TemplatedApp &&del(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&del(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("delete", pattern, std::move(handler));
         }
         return std::move(*this);
     }
 
-    TemplatedApp &&patch(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&patch(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("patch", pattern, std::move(handler));
         }
         return std::move(*this);
     }
 
-    TemplatedApp &&put(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&put(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("put", pattern, std::move(handler));
         }
         return std::move(*this);
     }
 
-    TemplatedApp &&head(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&head(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("head", pattern, std::move(handler));
         }
         return std::move(*this);
     }
 
-    TemplatedApp &&connect(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&connect(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("connect", pattern, std::move(handler));
         }
         return std::move(*this);
     }
 
-    TemplatedApp &&trace(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&trace(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("trace", pattern, std::move(handler));
         }
@@ -299,7 +466,7 @@ public:
     }
 
     /* This one catches any method */
-    TemplatedApp &&any(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&any(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
         if (httpContext) {
             httpContext->onHttp("*", pattern, std::move(handler));
         }
@@ -307,7 +474,7 @@ public:
     }
 
     /* Host, port, callback */
-    TemplatedApp &&listen(std::string host, int port, fu2::unique_function<void(us_listen_socket_t *)> &&handler) {
+    TemplatedApp &&listen(std::string host, int port, MoveOnlyFunction<void(us_listen_socket_t *)> &&handler) {
         if (!host.length()) {
             return listen(port, std::move(handler));
         }
@@ -316,7 +483,7 @@ public:
     }
 
     /* Host, port, options, callback */
-    TemplatedApp &&listen(std::string host, int port, int options, fu2::unique_function<void(us_listen_socket_t *)> &&handler) {
+    TemplatedApp &&listen(std::string host, int port, int options, MoveOnlyFunction<void(us_listen_socket_t *)> &&handler) {
         if (!host.length()) {
             return listen(port, options, std::move(handler));
         }
@@ -325,13 +492,13 @@ public:
     }
 
     /* Port, callback */
-    TemplatedApp &&listen(int port, fu2::unique_function<void(us_listen_socket_t *)> &&handler) {
+    TemplatedApp &&listen(int port, MoveOnlyFunction<void(us_listen_socket_t *)> &&handler) {
         handler(httpContext ? httpContext->listen(nullptr, port, 0) : nullptr);
         return std::move(*this);
     }
 
     /* Port, options, callback */
-    TemplatedApp &&listen(int port, int options, fu2::unique_function<void(us_listen_socket_t *)> &&handler) {
+    TemplatedApp &&listen(int port, int options, MoveOnlyFunction<void(us_listen_socket_t *)> &&handler) {
         handler(httpContext ? httpContext->listen(nullptr, port, options) : nullptr);
         return std::move(*this);
     }

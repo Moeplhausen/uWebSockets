@@ -22,6 +22,7 @@
 
 #include "AsyncSocket.h"
 #include "HttpResponseData.h"
+#include "HttpContext.h"
 #include "HttpContextData.h"
 #include "Utilities.h"
 
@@ -30,7 +31,7 @@
 #include "WebSocket.h"
 #include "WebSocketContextData.h"
 
-#include "f2/function2.hpp"
+#include "MoveOnlyFunction.h"
 
 /* todo: tryWrite is missing currently, only send smaller segments with write */
 
@@ -86,14 +87,14 @@ private:
 #ifndef UWS_HTTPRESPONSE_NO_WRITEMARK
         if (!Super::getLoopData()->noMark) {
             /* We only expose major version */
-            writeHeader("uWebSockets", "19");
+            writeHeader("uWebSockets", "20");
         }
 #endif
     }
 
     /* Returns true on success, indicating that it might be feasible to write more data.
      * Will start timeout if stream reaches totalSize or write failure. */
-    bool internalEnd(std::string_view data, size_t totalSize, bool optional, bool allowContentLength = true, bool closeConnection = false) {
+    bool internalEnd(std::string_view data, uintmax_t totalSize, bool optional, bool allowContentLength = true, bool closeConnection = false) {
         /* Write status if not already done */
         writeStatus(HTTP_200_OK);
 
@@ -214,7 +215,7 @@ public:
             struct us_socket_context_t *webSocketContext) {
 
         /* Extract needed parameters from WebSocketContextData */
-        WebSocketContextData<SSL> *webSocketContextData = (WebSocketContextData<SSL> *) us_socket_context_ext(SSL, webSocketContext);
+        WebSocketContextData<SSL, UserData> *webSocketContextData = (WebSocketContextData<SSL, UserData> *) us_socket_context_ext(SSL, webSocketContext);
 
         /* Note: OpenSSL can be used here to speed this up somewhat */
         char secWebSocketAccept[29] = {};
@@ -235,31 +236,41 @@ public:
         CompressOptions compressOptions = CompressOptions::DISABLED;
         if (secWebSocketExtensions.length() && webSocketContextData->compression != DISABLED) {
 
-            /* We always want shared inflation */
+            /* Make sure to map SHARED_DECOMPRESSOR to windowBits = 0, not 1  */
             int wantedInflationWindow = 0;
+            if ((webSocketContextData->compression & CompressOptions::_DECOMPRESSOR_MASK) != CompressOptions::SHARED_DECOMPRESSOR) {
+                wantedInflationWindow = (webSocketContextData->compression & CompressOptions::_DECOMPRESSOR_MASK) >> 8;
+            }
 
-            /* Map from selected compressor */
-            int wantedCompressionWindow = (webSocketContextData->compression & 0xFF00) >> 8;
+            /* Map from selected compressor (this automatically maps SHARED_COMPRESSOR to windowBits 0, not 1) */
+            int wantedCompressionWindow = (webSocketContextData->compression & CompressOptions::_COMPRESSOR_MASK) >> 4;
 
             auto [negCompression, negCompressionWindow, negInflationWindow, negResponse] =
-            uWS::negotiateCompression(true, wantedCompressionWindow, wantedInflationWindow,
+            negotiateCompression(true, wantedCompressionWindow, wantedInflationWindow,
                                         secWebSocketExtensions);
 
             if (negCompression) {
                 perMessageDeflate = true;
 
-                /* Map from windowBits to compressor */
+                /* Map from negotiated windowBits to compressor and decompressor */
                 if (negCompressionWindow == 0) {
                     compressOptions = CompressOptions::SHARED_COMPRESSOR;
                 } else {
-                    compressOptions = (CompressOptions) ((uint32_t) (negCompressionWindow << 8)
+                    compressOptions = (CompressOptions) ((uint32_t) (negCompressionWindow << 4)
                                                         | (uint32_t) (negCompressionWindow - 7));
 
                     /* If we are dedicated and have the 3kb then correct any 4kb to 3kb,
                      * (they both share the windowBits = 9) */
-                    if (webSocketContextData->compression == DEDICATED_COMPRESSOR_3KB) {
+                    if (webSocketContextData->compression & DEDICATED_COMPRESSOR_3KB) {
                         compressOptions = DEDICATED_COMPRESSOR_3KB;
                     }
+                }
+
+                /* Here we modify the above compression with negotiated decompressor */
+                if (negInflationWindow == 0) {
+                    compressOptions = CompressOptions(compressOptions | CompressOptions::SHARED_DECOMPRESSOR);
+                } else {
+                    compressOptions = CompressOptions(compressOptions | (negInflationWindow << 8));
                 }
 
                 writeHeader("Sec-WebSocket-Extensions", negResponse);
@@ -272,7 +283,7 @@ public:
         HttpContext<SSL> *httpContext = (HttpContext<SSL> *) us_socket_context(SSL, (struct us_socket_t *) this);
 
         /* Move any backpressure out of HttpResponse */
-        std::string backpressure(std::move(((AsyncSocketData<SSL> *) getHttpResponseData())->buffer));
+        BackPressure backpressure(std::move(((AsyncSocketData<SSL> *) getHttpResponseData())->buffer));
 
         /* Destroy HttpResponseData */
         getHttpResponseData()->~HttpResponseData();
@@ -281,12 +292,12 @@ public:
         bool wasCorked = Super::isCorked();
 
         /* Adopting a socket invalidates it, do not rely on it directly to carry any data */
-        WebSocket<SSL, true> *webSocket = (WebSocket<SSL, true> *) us_socket_context_adopt_socket(SSL,
+        WebSocket<SSL, true, UserData> *webSocket = (WebSocket<SSL, true, UserData> *) us_socket_context_adopt_socket(SSL,
                     (us_socket_context_t *) webSocketContext, (us_socket_t *) this, sizeof(WebSocketData) + sizeof(UserData));
 
         /* For whatever reason we were corked, update cork to the new socket */
         if (wasCorked) {
-            webSocket->AsyncSocket<SSL>::cork();
+            webSocket->AsyncSocket<SSL>::corkUnchecked();
         }
 
         /* Initialize websocket with any moved backpressure intact */
@@ -300,7 +311,7 @@ public:
         }
 
         /* Arm idleTimeout */
-        us_socket_timeout(SSL, (us_socket_t *) webSocket, webSocketContextData->idleTimeout);
+        us_socket_timeout(SSL, (us_socket_t *) webSocket, webSocketContextData->idleTimeoutComponents.first);
 
         /* Move construct the UserData right before calling open handler */
         new (webSocket->getUserData()) UserData(std::move(userData));
@@ -318,6 +329,19 @@ public:
     using Super::getRemoteAddress;
     using Super::getRemoteAddressAsText;
     using Super::getNativeHandle;
+
+    /* Throttle reads and writes */
+    HttpResponse *pause() {
+        Super::pause();
+        Super::timeout(0);
+        return this;
+    }
+
+    HttpResponse *resume() {
+        Super::resume();
+        Super::timeout(HTTP_TIMEOUT_S);
+        return this;
+    }
 
     /* Note: Headers are not checked in regards to timeout.
      * We only check when you actively push data or end the request */
@@ -368,6 +392,15 @@ public:
         return this;
     }
 
+    /* End without a body (no content-length) or end with a spoofed content-length. */
+    void endWithoutBody(std::optional<size_t> reportedContentLength = std::nullopt, bool closeConnection = false) {
+        if (reportedContentLength.has_value()) {
+            //internalEnd({nullptr, 0}, reportedContentLength.value(), false, true, closeConnection);
+        } else {
+            internalEnd({nullptr, 0}, 0, false, false, closeConnection);
+        }
+    }
+
     /* End the response with an optional data chunk. Always starts a timeout. */
     void end(std::string_view data = {}, bool closeConnection = false) {
         internalEnd(data, data.length(), false, true, closeConnection);
@@ -375,7 +408,7 @@ public:
 
     /* Try and end the response. Returns [true, true] on success.
      * Starts a timeout in some cases. Returns [ok, hasResponded] */
-    std::pair<bool, bool> tryEnd(std::string_view data, size_t totalSize = 0) {
+    std::pair<bool, bool> tryEnd(std::string_view data, uintmax_t totalSize = 0) {
         return {internalEnd(data, totalSize, true), hasResponded()};
     }
 
@@ -413,7 +446,7 @@ public:
     }
 
     /* Get the current byte write offset for this Http response */
-    size_t getWriteOffset() {
+    uintmax_t getWriteOffset() {
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
 
         return httpResponseData->offset;
@@ -427,7 +460,7 @@ public:
     }
 
     /* Corks the response if possible. Leaves already corked socket be. */
-    HttpResponse *cork(fu2::unique_function<void()> &&handler) {
+    HttpResponse *cork(MoveOnlyFunction<void()> &&handler) {
         if (!Super::isCorked() && Super::canCork()) {
             Super::cork();
             handler();
@@ -448,7 +481,7 @@ public:
     }
 
     /* Attach handler for writable HTTP response */
-    HttpResponse *onWritable(fu2::unique_function<bool(size_t)> &&handler) {
+    HttpResponse *onWritable(MoveOnlyFunction<bool(uintmax_t)> &&handler) {
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
 
         httpResponseData->onWritable = std::move(handler);
@@ -456,7 +489,7 @@ public:
     }
 
     /* Attach handler for aborted HTTP request */
-    HttpResponse *onAborted(fu2::unique_function<void()> &&handler) {
+    HttpResponse *onAborted(MoveOnlyFunction<void()> &&handler) {
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
 
         httpResponseData->onAborted = std::move(handler);
@@ -464,7 +497,7 @@ public:
     }
 
     /* Attach a read handler for data sent. Will be called with FIN set true if last segment. */
-    void onData(fu2::unique_function<void(std::string_view, bool)> &&handler) {
+    void onData(MoveOnlyFunction<void(std::string_view, bool)> &&handler) {
         HttpResponseData<SSL> *data = getHttpResponseData();
         data->inStream = std::move(handler);
     }

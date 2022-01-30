@@ -18,6 +18,8 @@
 #ifndef UWS_WEBSOCKETPROTOCOL_H
 #define UWS_WEBSOCKETPROTOCOL_H
 
+#include <libusockets.h>
+
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -33,6 +35,7 @@ const std::string_view ERR_TOO_BIG_MESSAGE_INFLATION("Received too big message, 
 const std::string_view ERR_INVALID_CLOSE_PAYLOAD("Received invalid close payload");
 
 enum OpCode : unsigned char {
+    CONTINUATION = 0,
     TEXT = 1,
     BINARY = 2,
     CLOSE = 8,
@@ -203,7 +206,7 @@ enum {
 };
 
 template <bool isServer>
-static inline size_t formatMessage(char *dst, const char *src, size_t length, OpCode opCode, size_t reportedLength, bool compressed) {
+static inline size_t formatMessage(char *dst, const char *src, size_t length, OpCode opCode, size_t reportedLength, bool compressed, bool fin) {
     size_t messageLength;
     size_t headerLength;
     if (reportedLength < 126) {
@@ -221,11 +224,9 @@ static inline size_t formatMessage(char *dst, const char *src, size_t length, Op
         memcpy(&dst[2], &tmp, sizeof(uint64_t));
     }
 
-    int flags = 0;
-    dst[0] = (char) ((flags & SND_NO_FIN ? 0 : 128) | (compressed ? SND_COMPRESSED : 0));
-    if (!(flags & SND_CONTINUATION)) {
-        dst[0] |= (char) opCode;
-    }
+    dst[0] = (char) ((fin ? 128 : 0) | ((compressed && opCode) ? SND_COMPRESSED : 0) | (char) opCode);
+
+    //printf("%d\n", (int)dst[0]);
 
     char mask[4];
     if (!isServer) {
@@ -271,6 +272,14 @@ protected:
     static inline unsigned char payloadLength(char *frame) {return ((unsigned char *) frame)[1] & 127;}
     static inline bool rsv23(char *frame) {return *((unsigned char *) frame) & 48;}
     static inline bool rsv1(char *frame) {return *((unsigned char *) frame) & 64;}
+
+    template <int N>
+    static inline void UnrolledXor(char * __restrict data, char * __restrict mask) {
+        if constexpr (N != 1) {
+            UnrolledXor<N - 1>(data, mask);
+        }
+        data[N - 1] ^= mask[(N - 1) % 4];
+    }
 
     static inline void unmaskImprecise(char *dst, char *src, char *mask, unsigned int length) {
         for (unsigned int n = (length >> 2) + 1; n; n--) {
@@ -359,6 +368,13 @@ protected:
         }
     }
 
+    /* This one is nicely vectorized on both ARM64 and X64 - especially with -mavx */
+    static inline void unmaskAll(char * __restrict data, char * __restrict mask) {
+        for (int i = 0; i < LIBUS_RECV_BUFFER_LENGTH; i += 16) {
+            UnrolledXor<16>(data + i, mask);
+        }
+    }
+
     static inline bool consumeContinuation(char *&src, unsigned int &length, WebSocketState<isServer> *wState, void *user) {
         if (wState->remainingBytes <= length) {
             if (isServer) {
@@ -383,7 +399,16 @@ protected:
             return true;
         } else {
             if (isServer) {
-                unmaskInplace(src, src + ((length >> 2) + 1) * 4, wState->mask);
+                /* No need to unmask if mask is 0 */
+                uint32_t nullmask = 0;
+                if (memcmp(wState->mask, &nullmask, sizeof(uint32_t))) {
+                    if /*constexpr*/ (LIBUS_RECV_BUFFER_LENGTH == length) {
+                        unmaskAll(src, wState->mask);
+                    } else {
+                        // Slow path
+                        unmaskInplace(src, src + ((length >> 2) + 1) * 4, wState->mask);
+                    }
+                }
             }
 
             wState->remainingBytes -= length;
